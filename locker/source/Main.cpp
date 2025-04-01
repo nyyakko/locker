@@ -1,19 +1,17 @@
-#include <chrono>
+#include <functional>
 #define NOMINMAX
 
 #include "os/process/ProcessWatcher.hpp"
 #include "os/process/ProcessInfo.hpp"
 #include "Memoizer.hpp"
 
-#include <cstring>
 #include <spdlog/spdlog.h>
 #include <fmt/format.h>
 
+#include <cstring>
 #include <unordered_map>
 #include <ranges>
 #include <algorithm>
-#include <thread>
-#include <mutex>
 
 #include "glad/glad.h"
 #include "gl/gl.h"
@@ -23,113 +21,6 @@
 #include "imgui/imgui_impl_opengl3.h"
 
 using namespace liberror;
-
-Result<void> process_listener_thread(
-    IEnumWbemClassObject* processCreationListener,
-    IEnumWbemClassObject* processDeletionListener,
-    std::unordered_map<std::string, std::string>& protectedPrograms,
-    std::mutex& protectedProgramsMutex,
-    std::vector<ProcessInfo>& requestedProgramsToBlock,
-    std::mutex& requestedProgramsToBlockMutex,
-    std::vector<std::string>& currentlyRunningProtectedPrograms,
-    std::mutex& currentlyRunningProtectedProgramsMutex,
-    std::atomic_bool const& shouldStop)
-{
-    while (!shouldStop.load())
-    {
-        // Process Creation Event Listener
-        {
-            IWbemClassObject* object = nullptr;
-            ULONG result = 0;
-            processCreationListener->Next(WBEM_NO_WAIT, 1, &object, &result);
-            if (result == 0) continue;
-
-            auto processInfo = get_started_process_info(object);
-            auto processName = processInfo.name | std::views::transform(tolower) | std::ranges::to<std::string>();
-
-            std::unique_lock protectedProgramsLock { protectedProgramsMutex };
-            auto isProgramProtected = protectedPrograms.contains(processName);
-            protectedProgramsLock.unlock();
-
-            std::unique_lock requestedProgramsToBlockLock { requestedProgramsToBlockMutex };
-            auto isProgramQueuedToBlock = std::ranges::contains(requestedProgramsToBlock, processInfo.name, &ProcessInfo::name);
-            requestedProgramsToBlockLock.unlock();
-
-            std::unique_lock currentlyRunningProtectedProgramsLock { currentlyRunningProtectedProgramsMutex };
-            auto isProtectedProgramRunning = std::ranges::contains(currentlyRunningProtectedPrograms, processInfo.name);
-            currentlyRunningProtectedProgramsLock.unlock();
-
-            if (isProgramProtected && !isProgramQueuedToBlock && !isProtectedProgramRunning)
-            {
-                std::scoped_lock requestedProgramsToBlockLock_ { requestedProgramsToBlockMutex };
-                requestedProgramsToBlock.push_back(processInfo);
-            }
-
-            object->Release();
-        }
-        // Process Deletion Event Listener
-        {
-            IWbemClassObject* object = nullptr;
-            ULONG result = 0;
-            processDeletionListener->Next(WBEM_NO_WAIT, 1, &object, &result);
-            if (result == 0) continue;
-
-            auto processInfo = get_started_process_info(object);
-            std::scoped_lock currentlyRunningProtectedProgramsLock { currentlyRunningProtectedProgramsMutex };
-            if (std::ranges::contains(currentlyRunningProtectedPrograms, processInfo.name))
-            {
-                auto processes = TRY(get_running_processes());
-                if (!processes.contains(processInfo.name))
-                {
-                    currentlyRunningProtectedPrograms.erase(std::ranges::find(currentlyRunningProtectedPrograms, processInfo.name));
-                    spdlog::info("[processListenerThread]: protected process {} was closed", processInfo.name);
-                }
-            }
-
-            object->Release();
-        }
-
-        std::this_thread::sleep_for(std::chrono::milliseconds(200));
-    }
-
-    return {};
-}
-
-Result<void> process_blocker_thread(
-    std::vector<ProcessInfo> const& requestedProgramsToBlock,
-    std::mutex& requestedProgramToBlockMutex,
-    std::vector<ProcessInfo>& currentlyBlockedProcesses,
-    std::mutex& currentlyBlockedProcessesMutex,
-    std::atomic_bool const& shouldStop)
-{
-    while (!shouldStop.load())
-    {
-        auto processes = TRY(get_running_processes());
-        for (auto const& process : processes)
-        {
-            std::unique_lock requestedProgramsToBlockLock { requestedProgramToBlockMutex };
-            auto isProgramQueuedToBlock = std::ranges::contains(requestedProgramsToBlock | std::views::transform(&ProcessInfo::name), process.first);
-            requestedProgramsToBlockLock.unlock();
-
-            std::unique_lock currentlyBlockedProcessesLock { currentlyBlockedProcessesMutex };
-            auto isProgramAlreadyBlocked = std::ranges::contains(currentlyBlockedProcesses | std::views::transform(&ProcessInfo::name), process.first);
-            currentlyBlockedProcessesLock.unlock();
-
-            if (isProgramQueuedToBlock && !isProgramAlreadyBlocked)
-            {
-                for (auto const& processToBlock : process.second)
-                {
-                    std::scoped_lock currentlyBlockedProcessesLock_ { currentlyBlockedProcessesMutex };
-                    currentlyBlockedProcesses.push_back(processToBlock);
-                    TRY(suspend_process_thread(processToBlock));
-                }
-            }
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(200));
-    }
-
-    return {};
-}
 
 size_t calculate_edit_distance(std::string_view a, std::string_view b)
 {
@@ -149,6 +40,81 @@ size_t calculate_edit_distance(std::string_view a, std::string_view b)
     };
 
     return memoizer(a, b);
+}
+
+struct ProcessListenerContext
+{
+    IEnumWbemClassObject* processCreationListener;
+    IEnumWbemClassObject* processDeletionListener;
+    std::unordered_map<std::string, std::string>& protectedPrograms;
+    std::unordered_map<std::basic_string<char>, std::vector<ProcessInfo>>& runningProcesses;
+    std::unordered_map<std::basic_string<char>, std::vector<ProcessInfo>>& suspensionQueue;
+    std::unordered_map<std::basic_string<char>, std::vector<ProcessInfo>>& suspendedProcesses;
+    std::unordered_map<std::basic_string<char>, std::vector<ProcessInfo>>& resumedProcesses;
+};
+
+void process_creation_handler(ProcessListenerContext& ctx)
+{
+    IWbemClassObject* object = nullptr;
+    ULONG result = 0;
+    ctx.processCreationListener->Next(WBEM_NO_WAIT, 1, &object, &result);
+    if (result == 0) return;
+
+    auto process = get_started_process_info(object);
+
+    if (ctx.protectedPrograms.contains(process.name) && !ctx.resumedProcesses.contains(process.name))
+    {
+        ctx.suspensionQueue[process.name].push_back(process);
+    }
+}
+
+void process_deletion_handler(ProcessListenerContext& ctx)
+{
+    IWbemClassObject* object = nullptr;
+    ULONG result = 0;
+    ctx.processDeletionListener->Next(WBEM_NO_WAIT, 1, &object, &result);
+    if (result == 0) return;
+
+    auto process = get_started_process_info(object);
+
+    if (!ctx.runningProcesses.contains(process.name) && ctx.resumedProcesses.contains(process.name))
+    {
+        ctx.resumedProcesses.erase(process.name);
+    }
+}
+
+void process_suspension_handler(ProcessListenerContext& ctx)
+{
+    for (auto& process : ctx.suspensionQueue)
+    {
+        for (auto& processThread : process.second)
+        {
+            ctx.suspendedProcesses[process.first].push_back(processThread);
+            MUST(suspend_process_thread(processThread));
+        }
+    }
+
+    std::ranges::for_each(ctx.suspendedProcesses, [&] (auto&& suspendedProcess) {
+        ctx.suspensionQueue.erase(suspendedProcess.first);
+    });
+}
+
+void process_resumption_handler(ProcessListenerContext& ctx, std::string_view password)
+{
+    for (auto& process : ctx.suspendedProcesses)
+    {
+        if (ctx.protectedPrograms.at(process.first) != password) continue;
+
+        for (auto& processThread : process.second)
+        {
+            ctx.resumedProcesses[process.first].push_back(processThread);
+            MUST(resume_process_thread(processThread));
+        }
+    }
+
+    std::ranges::for_each(ctx.resumedProcesses, [&] (auto&& resumedProcess) {
+        ctx.suspendedProcesses.erase(resumedProcess.first);
+    });
 }
 
 int main()
@@ -185,31 +151,10 @@ int main()
     auto processCreationListener = MUST(get_process_creation_event_listener(locator, service));
     auto processDeletionListener = MUST(get_process_deletion_event_listener(locator, service));
 
-    std::atomic_bool shouldStop = false;
-
-    std::unordered_map<std::string, std::string> protectedPrograms {};
-    std::mutex protectedProgramsMutex;
-
-    std::vector<ProcessInfo> requestedProgramsToBlock {};
-    std::mutex requestedProgramsToBlockMutex;
-
-    std::vector<ProcessInfo> currentlyBlockedProcesses {};
-    std::mutex currentlyBlockedProcessesMutex;
-
-    std::vector<std::string> currentlyRunningProtectedPrograms {};
-    std::mutex currentlyRunningProtectedProgramsMutex;
-
-    std::thread processListenerThread { [processCreationListener, processDeletionListener, &protectedPrograms, &protectedProgramsMutex, &requestedProgramsToBlock, &requestedProgramsToBlockMutex, &currentlyRunningProtectedPrograms, &currentlyRunningProtectedProgramsMutex, &shouldStop] () {
-        auto result = process_listener_thread(processCreationListener, processDeletionListener, protectedPrograms, protectedProgramsMutex, requestedProgramsToBlock, requestedProgramsToBlockMutex, currentlyRunningProtectedPrograms, currentlyRunningProtectedProgramsMutex, shouldStop);
-        if (!result.has_value())
-            spdlog::critical("[processListenerThread]: failed with error: {}", result.error().message());
-    }};
-
-    std::thread processBlockerThread { [&requestedProgramsToBlock, &requestedProgramsToBlockMutex, &currentlyBlockedProcesses, &currentlyBlockedProcessesMutex, &shouldStop] () {
-        auto result = process_blocker_thread(requestedProgramsToBlock, requestedProgramsToBlockMutex, currentlyBlockedProcesses, currentlyBlockedProcessesMutex, shouldStop);
-        if (!result.has_value())
-            spdlog::critical("[processListenerThread]: failed with error: {}", result.error().message());
-    }};
+    std::unordered_map<std::string, std::string> protectedProcesses {};
+    std::unordered_map<std::basic_string<char>, std::vector<ProcessInfo>> suspensionQueue {};
+    std::unordered_map<std::basic_string<char>, std::vector<ProcessInfo>> suspendedProcesses {};
+    std::unordered_map<std::basic_string<char>, std::vector<ProcessInfo>> resumedProcesses {};
 
     while (!glfwWindowShouldClose(window))
     {
@@ -218,60 +163,46 @@ int main()
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
 
+        auto runningProcesses = MUST(get_running_processes());
+
+        ProcessListenerContext processListenerContext {
+            processCreationListener,
+            processDeletionListener,
+            protectedProcesses,
+            runningProcesses,
+            suspensionQueue,
+            suspendedProcesses,
+            resumedProcesses
+        };
+
+        process_creation_handler(processListenerContext);
+        process_deletion_handler(processListenerContext);
+        process_suspension_handler(processListenerContext);
+
         ImGui::SetNextWindowPos({});
         ImGui::SetNextWindowSize({ static_cast<float>(width), static_cast<float>(height) });
         ImGui::Begin("Locker", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove);
 
-        std::unique_lock protectedProgramsLock { protectedProgramsMutex };
-
-        if (!currentlyBlockedProcesses.empty())
+        if (!suspendedProcesses.empty())
         {
             ImGui::OpenPopup("unlock_program_popup");
         }
-        protectedProgramsLock.unlock();
 
         if (ImGui::BeginPopup("unlock_program_popup"))
         {
             static char password[256] = {};
+            auto& processInfo = (processListenerContext.suspendedProcesses | std::views::values).front();
+            ImGui::Text("Type the password for %s", processInfo.front().name.data());
+            ImGui::Separator();
             ImGui::Text("Password");
             ImGui::InputText("##password", password, sizeof(password));
             if (ImGui::Button("Unlock"))
             {
-                protectedProgramsLock.lock();
-                std::scoped_lock currentlyBlockedProcessesLock { currentlyBlockedProcessesMutex };
-                auto blockedProgramName = currentlyBlockedProcesses.back().name | std::views::transform(tolower) | std::ranges::to<std::string>();
-                if (protectedPrograms.contains(blockedProgramName) && protectedPrograms.at(blockedProgramName) == password)
-                {
-                    for (auto const& process : currentlyBlockedProcesses)
-                    {
-                        auto processName = process.name | std::views::transform(tolower) | std::ranges::to<std::string>();
-                        if (protectedPrograms.at(processName) == password)
-                            MUST(resume_process_thread(process));
-                    }
-
-                    std::scoped_lock currentlyRunningProtectedProgramsLock { currentlyRunningProtectedProgramsMutex };
-                    currentlyRunningProtectedPrograms.push_back(currentlyBlockedProcesses.back().name);
-
-                    std::scoped_lock requestedProgramsToBlockLock { requestedProgramsToBlockMutex };
-                    if (!requestedProgramsToBlock.empty())
-                        requestedProgramsToBlock.erase(std::ranges::find(requestedProgramsToBlock, currentlyBlockedProcesses.back()));
-
-                    spdlog::info("[mainThread]: successfully unlocked process {}", currentlyBlockedProcesses.back().name);
-
-                    currentlyBlockedProcesses.clear();
-                    auto [first, last] = std::ranges::remove_if(currentlyBlockedProcesses, [&protectedPrograms] (ProcessInfo const& process) {
-                        return protectedPrograms.at(process.name) == password;
-                    });
-                    currentlyBlockedProcesses.erase(first, last);
-
-                    ImGui::CloseCurrentPopup();
-                }
-                protectedProgramsLock.unlock();
+                process_resumption_handler(processListenerContext, password);
+                ImGui::CloseCurrentPopup();
             }
             ImGui::EndPopup();
         }
-
-        auto processes = MUST(get_running_processes());
 
         ImGui::BeginGroup();
             static char searchProcessName[MAX_PATH] = {};
@@ -281,7 +212,7 @@ int main()
             ImGui::InputText("##search_process", searchProcessName, sizeof(searchProcessName));
 
             auto searchProcessNameFixed = std::string_view(searchProcessName) | std::views::transform(tolower) | std::ranges::to<std::string>();
-            auto filteredProcesses = std::views::filter(processes, [&searchProcessNameFixed] (std::pair<std::string, std::vector<ProcessInfo>> const& lhs) {
+            auto filteredProcesses = std::views::filter(runningProcesses, [&searchProcessNameFixed] (std::pair<std::string, std::vector<ProcessInfo>> const& lhs) {
                 if (searchProcessNameFixed.empty()) return true;
                 auto lhsFixed = lhs.first | std::views::transform(tolower) | std::ranges::to<std::string>();
                 lhsFixed = lhsFixed.substr(0, lhsFixed.find("."));
@@ -315,7 +246,7 @@ int main()
                     if (ImGui::Selectable(fmt::format("##{}", rowIndex).data(), selected, ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowDoubleClick))
                     {
                         selectedRow = static_cast<int>(rowIndex);
-                        selectedProcessName = process.first | std::views::transform(tolower) | std::ranges::to<std::string>();
+                        selectedProcessName = process.first;
                         if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
                         {
                             ImGui::OpenPopup("protect_program_popup");
@@ -330,9 +261,7 @@ int main()
                     ImGui::InputText("##password", password, sizeof(password));
                     if (ImGui::Button("Protect"))
                     {
-                        protectedProgramsLock.lock();
-                        protectedPrograms.insert({ selectedProcessName, password });
-                        protectedProgramsLock.unlock();
+                        protectedProcesses.insert({ selectedProcessName, password });
                         ImGui::CloseCurrentPopup();
                     }
                     ImGui::EndPopup();
@@ -340,7 +269,6 @@ int main()
 
                 ImGui::EndTable();
             }
-
         ImGui::EndGroup();
 
         ImGui::SameLine();
@@ -359,8 +287,7 @@ int main()
 
                 static auto selectedRow = -1;
 
-                protectedProgramsLock.lock();
-                for (auto const& [rowIndex, value] : std::views::enumerate(protectedPrograms))
+                for (auto const& [rowIndex, value] : std::views::enumerate(protectedProcesses))
                 {
                     auto const& program = value;
                     bool selected = static_cast<int>(rowIndex) == selectedRow;
@@ -378,7 +305,6 @@ int main()
                         selectedRow = static_cast<int>(rowIndex);
                     }
                 }
-                protectedProgramsLock.unlock();
 
                 ImGui::EndTable();
             }
@@ -394,11 +320,6 @@ int main()
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
         glfwSwapBuffers(window);
     }
-
-    shouldStop.store(true);
-
-    processBlockerThread.join();
-    processListenerThread.join();
 
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplGlfw_Shutdown();

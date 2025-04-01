@@ -22,6 +22,7 @@ struct ProcessInfo
 {
     std::string name;
     DWORD pid;
+    bool suspended;
 
     bool operator==(ProcessInfo const& that) const
     {
